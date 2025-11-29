@@ -1,0 +1,17 @@
+{
+  "name": "chat-assistant",
+  "version": "1.0.0",
+  "description": "Smart Learning Assistant with Voice Q&A",
+  "scripts": {
+    "start": "concurrently \"npm run backend\" \"npm run frontend\"",
+    "backend": "cd backend && .\\venv\\Scripts\\python.exe app.py",
+    "frontend": "cd frontend && npm start",
+    "install-all": "cd frontend && npm install && cd ../backend && pip install -r requirements.txt"
+  },
+  "dependencies": {
+    "concurrently": "^8.2.2"
+  },
+  "devDependencies": {
+    "@mermaid-js/mermaid-cli": "^11.9.0"
+  }
+}
