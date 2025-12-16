@@ -8,12 +8,17 @@ import uuid
 import tempfile
 import requests
 from dotenv import load_dotenv
+from openai import OpenAI
 from fpdf import FPDF
 import pdfplumber
+from youtubesearchpython import VideosSearch
+import yt_dlp
+import whisper
 from typing import List
 import shutil
 import subprocess
 from gtts import gTTS
+import random
 import re
 from collections import Counter, defaultdict
 import time
@@ -22,7 +27,8 @@ import smtplib
 from email.message import EmailMessage
 from werkzeug.security import generate_password_hash, check_password_hash
 from datetime import datetime, timedelta
-from models import db, User, QuizScore, ChatHistory
+import feedparser
+from models import db, User, QuizScore, ChatHistory, ChatSession, Document, FocusAreaDismissal, LearningPath, LearningPathStep, FeynmanScore, VideoSummary, CommunityTopic, CommunityComment
 
 # --- Simple in-memory analytics store (for backward compatibility) ---
 ANALYTICS = {
@@ -45,6 +51,11 @@ NVIDIA_API_KEY = (
 NVIDIA_API_BASE = os.getenv('NVIDIA_API_BASE', 'https://integrate.api.nvidia.com/v1')
 NVIDIA_MODEL = os.getenv('NVIDIA_MODEL', 'meta/llama-3.1-8b-instruct')
 SMTP_HOST = os.getenv('SMTP_HOST')
+
+client = OpenAI(
+    base_url=NVIDIA_API_BASE,
+    api_key=NVIDIA_API_KEY
+)
 SMTP_PORT = int(os.getenv('SMTP_PORT', '0') or 0)
 SMTP_USER = os.getenv('SMTP_USER')
 SMTP_PASS = os.getenv('SMTP_PASS')
@@ -72,6 +83,41 @@ with app.app_context():
 @app.route('/')
 def home():
     return jsonify({'message': 'Smart Learning Assistant Backend is running.'})
+
+@app.route('/api/test', methods=['POST'])
+def test_endpoint():
+    print("DEBUG: test endpoint hit")
+    return jsonify({'status': 'ok'})
+
+@app.route('/api/news', methods=['GET'])
+def get_news():
+    try:
+        # Use a reputable RSS feed (e.g., BBC World News)
+        feed_url = 'http://feeds.bbci.co.uk/news/world/rss.xml'
+        feed = feedparser.parse(feed_url)
+        
+        articles = []
+        # Get random 6 headlines from the available entries
+        entries = feed.entries
+        if entries:
+            # Shuffle to show different news on refresh
+            random.shuffle(entries)
+            selected_entries = entries[:6]
+        else:
+            selected_entries = []
+
+        for entry in selected_entries:
+            articles.append({
+                'title': entry.title,
+                'link': entry.link,
+                'summary': entry.summary,
+                'published': entry.published if hasattr(entry, 'published') else ''
+            })
+            
+        return jsonify({'articles': articles})
+    except Exception as e:
+        print(f"Error fetching news: {e}")
+        return jsonify({'error': 'Failed to fetch news'}), 500
 
 def _generate_verification_code() -> str:
     return f"{random.randint(100000, 999999)}"
@@ -114,8 +160,8 @@ def _queue_verification(email: str) -> bool:
         user.verified = False
         db.session.commit()
     sent = _send_verification_email(email, code)
-    if not sent:
-        print(f"Verification code for {email}: {code}")
+    # ALWAYS print the code for debugging purposes
+    print(f"DEBUG: Verification code for {email}: {code}")
     return sent
 
 def _issue_token(email: str) -> str:
@@ -482,29 +528,43 @@ def _chunk_text_by_chars(text: str, max_chunk_chars: int = 3500) -> List[str]:
 def _summarize_text_with_llm(source_text: str, max_words: int = 250) -> dict:
     """Summarize long text via chunked LLM calls, then meta-summarize."""
     import math
-    source_text = (source_text or '').strip()
-    if not source_text:
-        raise ValueError('Empty transcript')
+def _summarize_text_with_llm(text, max_words=250):
+    try:
+        # Check if max_words is "balanced" or similar string
+        if isinstance(max_words, str) and max_words.lower() == 'balanced':
+            limit_instruction = "Provide a comprehensive and balanced summary that covers all key points of the video, regardless of length. Do not be too brief, but avoid unnecessary fluff."
+        else:
+            try:
+                limit = int(max_words)
+            except:
+                limit = 250
+            limit_instruction = f"Keep the summary under approximately {limit} words."
 
-    chunks = _chunk_text_by_chars(source_text, 3500)
-    partial_summaries: List[str] = []
+        prompt = f"""
+You are an expert video summarizer.
+Your task is to create a clear, structured summary of the following video transcript.
 
-    # Per-chunk prompt
-    per_prompt = (
-        "Summarize the following transcript segment for a student audience. "
-        "Return ONLY well-formed paragraphs (no bullet points, no lists)."
-    )
+TRANSCRIPT:
+{text[:15000]}... (truncated if too long)
 
-    for segment in chunks or [source_text]:
-        try:
-            text = _nvidia_chat([
-                {"role": "system", "content": per_prompt},
-                {"role": "user", "content": segment[:6000]}
-            ], temperature=0.3, max_tokens=500)
-            partial_summaries.append(text.strip())
-        except Exception as e:
-            # If LLM unavailable, collect raw truncated text as a fallback
-            partial_summaries.append(segment[:500].strip())
+INSTRUCTIONS:
+1. Capture the main topic and purpose of the video.
+2. Bullet point the key takeaways and important details.
+3. {limit_instruction}
+4. Format with clear headings and bullet points using Markdown.
+"""
+        response = client.chat.completions.create(
+            model="gpt-3.5-turbo",
+            messages=[
+                {"role": "system", "content": "You are a helpful assistant that summarizes videos."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.7
+        )
+        return {'summary': response.choices[0].message.content}
+    except Exception as e:
+        print(f"LLM Summarization failed: {e}")
+        return {'summary': "Failed to generate summary.", 'error': str(e)}
 
     # Meta-summarize
     combined = '\n\n'.join(partial_summaries)[:6000]
@@ -794,10 +854,84 @@ def _transcribe_wav(wav_path: str) -> str:
         "Install local Whisper to enable real transcription."
     )
 
+@app.route('/api/video/save', methods=['POST'])
+def save_video_summary():
+    user_id = request.headers.get('X-User-Id')
+    if not user_id:
+        return jsonify({'error': 'Unauthorized'}), 401
+        
+    try:
+        data = request.json
+        title = data.get('title')
+        summary_text = data.get('summary_text')
+        video_url = data.get('video_url', '')
+
+        if not title or not summary_text:
+            return jsonify({'error': 'Title and summary are required'}), 400
+
+        new_summary = VideoSummary(
+            user_id=user_id,
+            title=title,
+            summary_text=summary_text,
+            video_url=video_url
+        )
+        db.session.add(new_summary)
+        if user:
+            _update_user_streak(user)
+        db.session.commit()
+
+        return jsonify({'message': 'Summary saved successfully', 'id': new_summary.id})
+    except Exception as e:
+        print(f"Error saving summary: {e}")
+        return jsonify({'error': 'Failed to save summary'}), 500
+
+@app.route('/api/video/saved', methods=['GET'])
+def get_saved_summaries():
+    user_id = request.headers.get('X-User-Id')
+    if not user_id:
+        return jsonify({'error': 'Unauthorized'}), 401
+        
+    try:
+        summaries = VideoSummary.query.filter_by(user_id=user_id).order_by(VideoSummary.created_at.desc()).all()
+        return jsonify({'summaries': [s.to_dict() for s in summaries]})
+    except Exception as e:
+        print(f"Error fetching saved summaries: {e}")
+        return jsonify({'error': 'Failed to fetch summaries'}), 500
+
+@app.route('/api/tts', methods=['POST'])
+def generate_tts():
+    try:
+        data = request.json
+        text = data.get('text')
+        if not text:
+            return jsonify({'error': 'Text is required'}), 400
+
+        # Truncate text if too long for simple TTS (optional limit)
+        if len(text) > 5000:
+            text = text[:5000]
+
+        tts = gTTS(text=text, lang='en')
+        
+        # Save to memory buffer
+        mp3_fp = io.BytesIO()
+        tts.write_to_fp(mp3_fp)
+        mp3_fp.seek(0)
+        
+        return send_file(
+            mp3_fp,
+            mimetype="audio/mpeg",
+            as_attachment=False,
+            download_name="summary_audio.mp3"
+        )
+    except Exception as e:
+        print(f"Error generating TTS: {e}")
+        return jsonify({'error': 'Failed to generate audio'}), 500
+
 @app.route('/api/summarize-video', methods=['POST'])
 def summarize_video():
     try:
         print("=== Video Summarization Started ===")
+
         if not (request.content_type and 'multipart/form-data' in request.content_type):
             return jsonify({'error': 'Use multipart/form-data with field "video"'}), 400
         if 'video' not in request.files:
@@ -843,6 +977,7 @@ def summarize_video():
 @app.route('/api/summarize-url', methods=['POST'])
 def summarize_url():
     try:
+        # print("DEBUG: summarize_url endpoint hit", flush=True)
         data = request.get_json() or {}
         url = (data.get('url') or '').strip()
         max_words = int(data.get('maxWords', 250))
@@ -864,20 +999,22 @@ def summarize_url():
                 if video_id:
                     # Attempt to fetch captions via yt-dlp (no download)
                     try:
-                        import yt_dlp  # type: ignore
                         ydl_opts = {
                             'quiet': True,
                             'no_warnings': True,
                             'skip_download': True,
+                            'socket_timeout': 10,
                         }
                         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                             info = ydl.extract_info(url, download=False)
+                        
                         captions_text = ''
                         # Prefer human subtitles; fallback to automatic captions
                         subtitle_sets = [
                             (info.get('subtitles') or {}),
                             (info.get('automatic_captions') or {})
                         ]
+                        
                         def pick_lang(subs_dict):
                             for lang_key in ['en', 'en-US', 'en-GB']:
                                 if lang_key in subs_dict:
@@ -887,156 +1024,120 @@ def summarize_url():
                                 first_key = next(iter(subs_dict.keys()))
                                 return subs_dict[first_key]
                             return None
+                            
                         picked = None
                         for s in subtitle_sets:
                             picked = pick_lang(s)
                             if picked:
                                 break
+                                
                         if picked:
                             # Find a URL (prefer vtt)
                             sub_url = None
-                            # picked is a list of dicts with 'url' and 'ext'
-                            vtt = next((e for e in picked if e.get('ext') == 'vtt' and e.get('url')), None)
-                            sub_entry = vtt or (picked[0] if picked else None)
-                            if sub_entry and sub_entry.get('url'):
-                                sub_url = sub_entry['url']
+                            for item in picked:
+                                if item.get('ext') == 'vtt':
+                                    sub_url = item.get('url')
+                                    break
+                            if not sub_url and picked:
+                                sub_url = picked[0].get('url')
+                            
                             if sub_url:
-                                resp = requests.get(sub_url, timeout=20)
-                                raw = resp.text
-                                # Parse WEBVTT into segments with timestamps
-                                segments = []
-                                current_times = None
-                                for line in raw.splitlines():
-                                    l = line.strip()
-                                    if not l:
-                                        continue
-                                    if l.startswith('WEBVTT') or re.match(r'^\d+$', l):
-                                        continue
-                                    if '-->' in l:
-                                        current_times = l
-                                        continue
-                                    # text line
-                                    if current_times:
-                                        try:
-                                            start = current_times.split('-->')[0].strip()
-                                            # convert HH:MM:SS.mmm to seconds
-                                            def _to_secs(ts):
-                                                parts = ts.split(':')
-                                                h, m = int(parts[-3]), int(parts[-2])
-                                                s = float(parts[-1].replace(',', '.'))
-                                                return h*3600 + m*60 + s
-                                            start_s = _to_secs(start)
-                                        except Exception:
-                                            start_s = 0.0
-                                        segments.append({'start': round(start_s, 2), 'text': l})
-                                        current_times = None
-                                captions_text = re.sub(r'\s+', ' ', ' '.join(seg['text'] for seg in segments)).strip()
-                                # Derive simple chapters by gaps between segment starts (> 60s) or every ~90s
-                                chapters = []
-                                last_cut = 0.0
-                                buf = []
-                                for seg in segments:
-                                    if not buf:
-                                        buf.append(seg)
-                                        last_cut = seg['start']
-                                        continue
-                                    if seg['start'] - last_cut >= 90.0 or len(buf) >= 12:
-                                        chap_text = ' '.join(b['text'] for b in buf)
-                                        chapters.append({'start': buf[0]['start'], 'text': chap_text[:400]})
-                                        buf = [seg]
-                                        last_cut = seg['start']
-                                    else:
-                                        buf.append(seg)
-                                if buf:
-                                    chap_text = ' '.join(b['text'] for b in buf)
-                                    chapters.append({'start': buf[0]['start'], 'text': chap_text[:400]})
+                                # fetch captions
+                                cap_res = requests.get(sub_url, timeout=10)
+                                if cap_res.status_code == 200:
+                                    captions_text = cap_res.text
+                                    # Simple cleanup of VTT
+                                    lines = captions_text.splitlines()
+                                    clean_lines = []
+                                    for line in lines:
+                                        if '-->' in line: continue
+                                        if not line.strip(): continue
+                                        if line.strip().isdigit(): continue
+                                        if line.strip().startswith('WEBVTT'): continue
+                                        clean_lines.append(line.strip())
+                                    captions_text = ' '.join(clean_lines)
+                        
                         if captions_text:
-                            transcript = captions_text
-                            result = _summarize_text_with_llm(transcript, max_words=max_words)
-                            result.update({
-                                'status': 'success',
-                                'source': 'youtube_captions',
-                                'video_id': video_id,
-                                'url': url,
-                                'segments': segments[:200],
-                                'chapters': chapters[:20]
-                            })
-                            return jsonify(result)
-                    except Exception as cap_err:
-                        print(f"yt-dlp captions fetch failed: {cap_err}")
-
-                    # Fallback: attempt audio download and local transcription (if Whisper available)
-                    try:
-                        import yt_dlp  # type: ignore
-                        tmp_dir = tempfile.mkdtemp(prefix='yt_')
-                        ydl_opts_dl = {
+                            # Summarize captions
+                            result = _summarize_text_with_llm(captions_text, max_words=max_words)
+                            result.update({'video_id': video_id, 'url': url})
+                            return jsonify({'status': 'success', **result})
+                            
+                    except Exception as e:
+                        print(f"YouTube caption fetch failed: {e}")
+                        # Fall through to normal processing (or error)
+                        pass
+        
+                # Fallback: attempt audio download and local transcription using Whisper
+                try:
+                    print("DEBUG: Captions unavailable, attempting audio download...", flush=True)
+                    with tempfile.TemporaryDirectory() as temp_dir:
+                        # Configure yt-dlp to download audio
+                        ydl_opts_audio = {
+                            'format': 'bestaudio/best',
+                            'outtmpl': os.path.join(temp_dir, '%(id)s.%(ext)s'),
+                            'postprocessors': [{
+                                'key': 'FFmpegExtractAudio',
+                                'preferredcodec': 'mp3',
+                                'preferredquality': '192',
+                            }],
                             'quiet': True,
                             'no_warnings': True,
-                            'format': 'bestaudio/best',
-                            'paths': {'home': tmp_dir},
-                            'outtmpl': '%(id)s.%(ext)s'
                         }
+                        
                         audio_path = None
-                        with yt_dlp.YoutubeDL(ydl_opts_dl) as ydl:
-                            info2 = ydl.extract_info(url, download=True)
-                            # Try to locate downloaded file
-                            # Newer yt-dlp may expose 'requested_downloads'
-                            req = (info2.get('requested_downloads') or [])
-                            if req and req[0].get('filepath'):
-                                audio_path = req[0]['filepath']
-                            else:
-                                audio_path = info2.get('filepath') or None
-                            if not audio_path:
-                                # fallback: search tmp_dir
-                                for root, _, files in os.walk(tmp_dir):
-                                    for f in files:
-                                        if f.startswith(video_id):
-                                            audio_path = os.path.join(root, f)
-                                            break
-                                    if audio_path:
-                                        break
-                        transcript = None
-                        wav_path = None
+                        with yt_dlp.YoutubeDL(ydl_opts_audio) as ydl:
+                            ydl.download([url])
+                            # Find the downloaded file
+                            for file in os.listdir(temp_dir):
+                                if file.endswith('.mp3'):
+                                    audio_path = os.path.join(temp_dir, file)
+                                    break
+                        
                         if audio_path and os.path.exists(audio_path):
-                            try:
-                                wav_path = _extract_audio_wav(audio_path)
-                                transcript = _transcribe_wav(wav_path)
-                            finally:
-                                _safe_remove(wav_path)
-                                _safe_remove(audio_path)
-                                try:
-                                    shutil.rmtree(tmp_dir, ignore_errors=True)
-                                except Exception:
-                                    pass
-                        if transcript:
-                            result = _summarize_text_with_llm(transcript, max_words=max_words)
-                            result.update({
-                                'status': 'success',
-                                'source': 'youtube_audio_transcription',
-                                'video_id': video_id,
-                                'url': url
-                            })
-                            return jsonify(result)
-                    except Exception as dl_err:
-                        print(f"yt-dlp audio download/transcription failed: {dl_err}")
+                            print(f"DEBUG: Audio downloaded to {audio_path}, starting transcription...", flush=True)
+                            # Load Whisper model (use 'base' for speed/accuracy balance)
+                            model = whisper.load_model("base")
+                            transcription_result = model.transcribe(audio_path)
+                            transcript_text = transcription_result["text"]
+                            
+                            if transcript_text:
+                                print("DEBUG: Transcription successful", flush=True)
+                                result = _summarize_text_with_llm(transcript_text, max_words=max_words)
+                                result.update({
+                                    'status': 'success', 
+                                    'warnings': ['generated_from_audio'],
+                                    'video_id': video_id,
+                                    'url': url
+                                })
+                                return jsonify(result)
+                                
+                except Exception as e:
+                    print(f"Audio fallback failed: {e}", flush=True)
+                    # If fallback fails, return the guidance message
+                    pass
 
-                    # Last resort: guidance message
-                    transcript = (
-                        f"This is a YouTube video (ID: {video_id}). "
-                        "Captions were unavailable or could not be fetched automatically.\n\n"
-                        "Please use the 'Upload Video' tab to upload the file, or paste the transcript in the 'Paste Transcript' tab."
-                    )
-                    result = _summarize_text_with_llm(transcript, max_words=max_words)
-                    result.update({
-                        'status': 'success', 
-                        'warnings': ['youtube_fetch_limited'],
-                        'video_id': video_id,
-                        'url': url
-                    })
-                    return jsonify(result)
-                else:
-                    return jsonify({'error': 'Could not extract YouTube video ID from URL'}), 400
-                    
+                # If we reach here, both captions and audio fallback failed
+                transcript = (
+                    f"This is a YouTube video (ID: {video_id}). "
+                    "Captions were unavailable and audio transcription failed.\n\n"
+                    "Please use the 'Upload Video' tab to upload the file, or paste the transcript in the 'Paste Transcript' tab."
+                )
+                # Return guidance directly without LLM summary to avoid conversational response
+                result = {
+                    'summary': transcript,
+                    'bullets': [],
+                    'keywords': [],
+                    'chunks': 0
+                }
+                result.update({
+                    'status': 'success', 
+                    'warnings': ['youtube_fetch_limited', 'audio_fallback_failed'],
+                    'video_id': video_id,
+                    'url': url
+                })
+                return jsonify(result)
+
             except Exception as e:
                 return jsonify({'error': f'Error processing YouTube URL: {str(e)}'}), 500
         else:
@@ -1048,7 +1149,13 @@ def summarize_url():
                 "2. Copy the transcript/captions and use the 'Paste Transcript' tab."
             )
             
-            result = _summarize_text_with_llm(transcript, max_words=max_words)
+            # Return guidance directly without LLM summary
+            result = {
+                'summary': transcript,
+                'bullets': [],
+                'keywords': [],
+                'chunks': 0
+            }
             result.update({
                 'status': 'success', 
                 'warnings': ['non_youtube_url', 'use_upload_or_transcript_tabs']
@@ -1113,6 +1220,242 @@ def _format_paragraphs(text: str) -> str:
         return text
 
 
+@app.route('/api/chat/sessions', methods=['GET'])
+def get_chat_sessions():
+    user = _get_current_user()
+    if not user:
+        # For anonymous users, we might want to support local storage based sessions or just return empty
+        # But for now, let's require auth for history or handle anonymous differently
+        return jsonify({'sessions': []})
+    
+    sessions = ChatSession.query.filter_by(user_id=user.id).order_by(ChatSession.updated_at.desc()).all()
+    return jsonify({'sessions': [s.to_dict() for s in sessions]})
+
+@app.route('/api/chat/sessions/<session_id>', methods=['GET'])
+def get_chat_session(session_id):
+    user = _get_current_user()
+    # Allow anonymous access if session exists? Maybe not for privacy.
+    # But for now, let's check user ownership if logged in.
+    
+    if user:
+        session = ChatSession.query.filter_by(id=session_id, user_id=user.id).first()
+    else:
+        # If anonymous, maybe allow if they have the ID? 
+        # But we don't store anonymous user_id easily.
+        # Let's assume history is a logged-in feature for now.
+        return jsonify({'error': 'Unauthorized'}), 401
+        
+    if not session:
+        return jsonify({'error': 'Session not found'}), 404
+        
+    messages = ChatHistory.query.filter_by(session_id=session_id).order_by(ChatHistory.created_at.asc()).all()
+    return jsonify({
+        'session': session.to_dict(),
+        'messages': [m.to_dict() for m in messages]
+    })
+
+@app.route('/api/chat/sessions', methods=['POST'])
+def create_chat_session():
+    user = _get_current_user()
+    if not user:
+        return jsonify({'error': 'Unauthorized'}), 401
+        
+    data = request.get_json(silent=True) or {}
+    title = data.get('title', 'New Chat')
+    
+    session = ChatSession(
+        id=str(uuid.uuid4()),
+        user_id=user.id,
+        title=title
+    )
+    db.session.add(session)
+    db.session.commit()
+    return jsonify(session.to_dict())
+
+@app.route('/api/chat/sessions/<session_id>', methods=['DELETE'])
+def delete_chat_session(session_id):
+    user = _get_current_user()
+    if not user:
+        return jsonify({'error': 'Unauthorized'}), 401
+        
+    session = ChatSession.query.filter_by(id=session_id, user_id=user.id).first()
+    if not session:
+        return jsonify({'error': 'Session not found'}), 404
+        
+    db.session.delete(session)
+    db.session.commit()
+    return jsonify({'message': 'Session deleted'})
+
+# --- Document Management Endpoints ---
+
+@app.route('/api/documents', methods=['GET'])
+def get_documents():
+    user = _get_current_user()
+    if not user:
+        return jsonify({'documents': []})
+    
+    docs = Document.query.filter_by(user_id=user.id).order_by(Document.created_at.desc()).all()
+    return jsonify({'documents': [d.to_dict() for d in docs]})
+
+@app.route('/api/documents', methods=['POST'])
+def upload_document():
+    user = _get_current_user()
+    if not user:
+        return jsonify({'error': 'Unauthorized'}), 401
+        
+    if 'file' not in request.files:
+        return jsonify({'error': 'No file provided'}), 400
+        
+    file = request.files['file']
+    if not file.filename:
+        return jsonify({'error': 'No file selected'}), 400
+        
+    if not file.filename.lower().endswith('.pdf'):
+        return jsonify({'error': 'Only PDF files are supported'}), 400
+        
+    try:
+        # Extract text from PDF
+        text = ""
+        with pdfplumber.open(file) as pdf:
+            for page in pdf.pages:
+                text += page.extract_text() + "\n"
+        
+        if not text.strip():
+            return jsonify({'error': 'Could not extract text from PDF'}), 400
+            
+        # Save to database
+        doc = Document(
+            id=str(uuid.uuid4()),
+            user_id=user.id,
+            filename=file.filename,
+            content=text
+        )
+        db.session.add(doc)
+        db.session.commit()
+        
+        return jsonify(doc.to_dict())
+        
+    except Exception as e:
+        print(f"PDF upload error: {e}")
+        return jsonify({'error': 'Failed to process PDF'}), 500
+
+@app.route('/api/documents/<doc_id>', methods=['DELETE'])
+def delete_document(doc_id):
+    user = _get_current_user()
+    if not user:
+        return jsonify({'error': 'Unauthorized'}), 401
+        
+    doc = Document.query.filter_by(id=doc_id, user_id=user.id).first()
+    if not doc:
+        return jsonify({'error': 'Document not found'}), 404
+        
+    db.session.delete(doc)
+    db.session.commit()
+    return jsonify({'message': 'Document deleted'})
+
+# --- Analytics Endpoints ---
+
+@app.route('/api/analytics/dashboard', methods=['GET'])
+def get_analytics_dashboard():
+    user = _get_current_user()
+    if not user:
+        return jsonify({'error': 'Unauthorized'}), 401
+        
+    # Fetch all quiz scores for the user
+    scores = QuizScore.query.filter_by(user_id=user.id).order_by(QuizScore.created_at.asc()).all()
+    
+    total_quizzes = len(scores)
+    if total_quizzes == 0:
+        return jsonify({
+            'total_quizzes': 0,
+            'average_score': 0,
+            'recent_activity': [],
+            'weak_areas': []
+        })
+        
+    # Calculate Average Score
+    total_score = sum(s.score_percentage for s in scores)
+    average_score = round(total_score / total_quizzes, 1)
+    
+    # Prepare Recent Activity (Last 10)
+    # Format for Recharts: { date: 'YYYY-MM-DD', score: 85 }
+    recent_activity = []
+    for s in scores[-10:]:
+        recent_activity.append({
+            'date': s.created_at.strftime('%Y-%m-%d'),
+            'score': s.score_percentage,
+            'title': s.quiz_title or 'Untitled Quiz'
+        })
+        
+    # Fetch dismissed focus areas
+    dismissed = FocusAreaDismissal.query.filter_by(user_id=user.id).all()
+    dismissed_ids = {d.quiz_score_id for d in dismissed}
+
+    # Identify Weak Areas (Score < 60%)
+    weak_areas = []
+    for s in scores:
+        if s.score_percentage < 60 and s.id not in dismissed_ids:
+            weak_areas.append({
+                'id': s.id,
+                'title': s.quiz_title or 'Untitled Quiz',
+                'score': s.score_percentage,
+                'date': s.created_at.strftime('%Y-%m-%d'),
+                'video_suggestion_url': f"https://www.youtube.com/results?search_query=learn+{requests.utils.quote(s.quiz_title or 'general knowledge')}"
+            })
+    
+    # Sort weak areas by date desc (most recent first)
+    weak_areas.sort(key=lambda x: x['date'], reverse=True)
+
+    # 3. Subject Mastery (Bar Chart Data)
+    # Group scores by topic (using crude string matching or stored topic)
+    topic_scores = defaultdict(list)
+    for s in scores:
+        t = (s.quiz_title or 'General').lower()
+        # Clean up topic name a bit (remove "quiz on ", etc)
+        t = t.replace('quiz on ', '').replace(' quiz', '').strip().title()
+        topic_scores[t].append(s.score_percentage)
+    
+    mastery_distribution = []
+    for t, vals in topic_scores.items():
+        if len(vals) > 0:
+            avg = sum(vals) / len(vals)
+            mastery_distribution.append({'subject': t, 'score': round(avg, 1), 'count': len(vals)})
+    
+    # Sort by score desc and take top 5
+    mastery_distribution.sort(key=lambda x: x['score'], reverse=True)
+    mastery_distribution = mastery_distribution[:6]
+
+    # 4. Activity Breakdown (Pie Chart Data)
+    # Count different types of activities
+    summaries_count = VideoSummary.query.filter_by(user_id=user.id).count()
+    feynman_count = FeynmanScore.query.filter_by(user_id=user.id).count()
+    
+    activity_breakdown = [
+        {'name': 'Quizzes', 'value': total_quizzes, 'color': '#0088FE'},
+        {'name': 'Video Summaries', 'value': summaries_count, 'color': '#00C49F'},
+        {'name': 'Teaching (Feynman)', 'value': feynman_count, 'color': '#FFBB28'}
+    ]
+    # Filter out zero values
+    activity_breakdown = [x for x in activity_breakdown if x['value'] > 0]
+
+    current_streak = user.current_streak
+    max_streak = user.max_streak
+
+    return jsonify({
+        'total_quizzes': total_quizzes,
+        'average_score': average_score,
+        'recent_activity': recent_activity,
+        'weak_areas': weak_areas[:5],
+        'mastery_distribution': mastery_distribution,
+        'activity_breakdown': activity_breakdown,
+        'streak': {
+            'current': current_streak,
+            'max': max_streak,
+            'last_activity': user.last_activity_date.isoformat() if user.last_activity_date else None
+        }
+    })
+
+
 @app.route('/api/voice-qa-stream', methods=['GET'])
 def voice_qa_stream():
     try:
@@ -1162,8 +1505,13 @@ def voice_qa_stream():
 @app.route('/api/voice-qa', methods=['POST'])
 def voice_qa():
     try:
+        user = _get_current_user()
+        
         # Check if it's a text question or audio file
         want_tts = False
+        session_id = None
+        document_id = None
+        
         if request.content_type and 'multipart/form-data' in request.content_type:
             # Audio file upload
             if 'audio' not in request.files:
@@ -1171,6 +1519,8 @@ def voice_qa():
             
             audio_file = request.files['audio']
             want_tts = (request.form.get('tts') or 'false').lower() == 'true'
+            session_id = request.form.get('session_id')
+            document_id = request.form.get('document_id')
             
             # Save audio file temporarily
             with tempfile.NamedTemporaryFile(delete=False, suffix='.wav') as temp_file:
@@ -1179,7 +1529,12 @@ def voice_qa():
             
             try:
                 # For now, we'll use a simple fallback for speech-to-text
+                # In a real app, use Whisper here
                 question = "What is artificial intelligence and how does it work?"
+                # If we had real transcription, we'd use it here
+                # transcript = _transcribe_wav(temp_file_path)
+                # if transcript: question = transcript
+                
                 print("Speech-to-text not implemented yet - using fallback")
                 
                 # Clean up temporary file
@@ -1198,14 +1553,49 @@ def voice_qa():
             
             question = data['question']
             want_tts = bool(data.get('tts', False))
+            session_id = data.get('session_id')
+            document_id = data.get('document_id')
         
         # Use NVIDIA API for AI responses
         try:
             print(f"Attempting NVIDIA chat. Base={NVIDIA_API_BASE}, Model={NVIDIA_MODEL}")
-            print(f"Key present: {bool(NVIDIA_API_KEY)}")
-            answer = _nvidia_chat([
-                {"role": "user", "content": question}
-            ], max_tokens=1500)
+            
+            messages = []
+            mode = request.form.get('mode') if request.content_type and 'multipart/form-data' in request.content_type else (data.get('mode') if 'data' in locals() else None)
+
+            # System Prompt Selection
+            if mode == 'interview':
+                system_prompt = (
+                    "You are a professional technical interviewer. "
+                    "Conduct a mock interview with the user for the role they specify. "
+                    "Ask one question at a time. "
+                    "Evaluate their answers briefly and then ask the next relevant question. "
+                    "Be professional, encouraging, but rigorous. "
+                    "Start by asking them what role they are applying for if they haven't said it yet."
+                )
+                messages.append({"role": "system", "content": system_prompt})
+            
+            # Inject Document Context if provided (can be combined with interview)
+            if document_id and user:
+                doc = Document.query.filter_by(id=document_id, user_id=user.id).first()
+                if doc:
+                    # Truncate content to avoid token limits (simple approach)
+                    context_text = doc.content[:10000] 
+                    if mode == 'interview':
+                        messages.append({
+                            "role": "system", 
+                            "content": f"Use the following document as the resume or job description context for the interview.\n\nContext:\n{context_text}"
+                        })
+                    else:
+                        messages.append({
+                            "role": "system", 
+                            "content": f"You are a helpful assistant. Use the following document content to answer the user's question. If the answer is not in the document, say so.\n\nDocument Content:\n{context_text}"
+                        })
+                    print(f"Using document context: {doc.filename}")
+            
+            messages.append({"role": "user", "content": question})
+            
+            answer = _nvidia_chat(messages, max_tokens=1500)
             provider = 'nvidia'
             print("Successfully got response from NVIDIA API")
         except Exception as ai_error:
@@ -1224,6 +1614,47 @@ def voice_qa():
                 answer = "React is a JavaScript library for building user interfaces, particularly single-page applications. It's maintained by Facebook and allows developers to create reusable UI components. React uses a virtual DOM for efficient rendering and is popular for modern web development."
             else:
                 answer = f"I'm here to help with your learning questions! You asked: '{question}'. I can assist with topics like programming, artificial intelligence, machine learning, web development, and more. Feel free to ask me anything about these subjects."
+        
+        # Save to history if user is logged in
+        if user:
+            if not session_id:
+                # Create new session
+                # Generate a simple title from the first question
+                title = question[:60] + "..." if len(question) > 60 else question
+                session = ChatSession(
+                    id=str(uuid.uuid4()),
+                    user_id=user.id,
+                    title=title
+                )
+                db.session.add(session)
+                session_id = session.id
+            else:
+                # Verify session exists and belongs to user
+                session = ChatSession.query.filter_by(id=session_id, user_id=user.id).first()
+                if not session:
+                    # If invalid session, create new one
+                    title = question[:60] + "..." if len(question) > 60 else question
+                    session = ChatSession(
+                        id=str(uuid.uuid4()),
+                        user_id=user.id,
+                        title=title
+                    )
+                    db.session.add(session)
+                    session_id = session.id
+                else:
+                    session.updated_at = datetime.utcnow()
+            
+            # Save message
+            history = ChatHistory(
+                user_id=user.id,
+                session_id=session_id,
+                user_message=question,
+                ai_response=answer,
+                context='voice_qa'
+            )
+            db.session.add(history)
+            db.session.commit()
+
         # Optionally synthesize answer to audio (MP3) when requested
         audio_b64 = None
         if want_tts and answer:
@@ -1241,6 +1672,7 @@ def voice_qa():
             'answer': answer,
             'status': 'success',
             'provider': provider,
+            'session_id': session_id,
             'nvidia': {
                 'base': NVIDIA_API_BASE,
                 'model': NVIDIA_MODEL,
@@ -1386,7 +1818,7 @@ def generate_quiz():
         
         system_prompt = (
             "You are an expert assessment designer creating HIGHLY DIVERSE, content-specific multiple-choice questions.\n"
-            "OUTPUT STRICT JSON ONLY: {\"items\":[{\"id\":\"uuid\",\"question\":\"...\",\"options\":[\"...\",\"...\",\"...\",\"...\"],\"correctAnswer\":0}]}\n"
+            "OUTPUT STRICT JSON ONLY: {\"title\": \"Short Descriptive Topic Title\", \"items\":[{\"id\":\"uuid\",\"topic\":\"Specific Concept\",\"question\":\"...\",\"options\":[\"...\",\"...\",\"...\",\"...\"],\"correctAnswer\":0}]}\n"
             "\n"
             "MAXIMUM DIVERSITY REQUIREMENTS:\n"
             "- Create EXTREMELY DIVERSE questions that test different cognitive levels\n"
@@ -1422,6 +1854,8 @@ def generate_quiz():
             "- Ensure correct answers are DIRECTLY supported by the provided text\n"
             "- Test comprehension of DIFFERENT sections, concepts, and details\n"
             "- Include questions about specific examples, case studies, or data points\n"
+            "- Assign a specific 'topic' tag to each question (e.g., 'History', 'Biology', 'Python')\n"
+            "- GENERATE A SHORT, DESCRIPTIVE TITLE for the quiz based on the content (e.g., 'Introduction to Quantum Mechanics')\n"
             "\n"
             "TECHNICAL REQUIREMENTS:\n"
             "- Exactly 4 options, 1 correct answer\n"
@@ -1449,16 +1883,27 @@ def generate_quiz():
             start = ai_text.find('{')
             end = ai_text.rfind('}')
             items = []
+            generated_title = None
+            
             if start != -1 and end != -1 and end > start:
                 snippet = ai_text[start:end+1]
                 try:
                     parsed = json.loads(snippet)
-                    items = parsed.get('items') if isinstance(parsed, dict) else parsed
+                    if isinstance(parsed, dict):
+                        items = parsed.get('items')
+                        generated_title = parsed.get('title')
+                    else:
+                        items = parsed
                 except Exception:
                     items = []
 
             if not items or not isinstance(items, list):
                 raise RuntimeError('Model did not return valid JSON items')
+
+            # STRICTLY enforce the requested number of questions
+            if len(items) > num_questions:
+                print(f"DEBUG: Trimming generated items from {len(items)} to {num_questions}")
+                items = items[:num_questions]
 
             # Normalize and ensure IDs exist; enforce exactly 4 options and 1 correct
             normalized = []
@@ -1466,6 +1911,7 @@ def generate_quiz():
                 q = str(it.get('question', '')).strip()
                 options = it.get('options', [])
                 correct_answer = it.get('correctAnswer', 0)
+                topic = str(it.get('topic') or 'General').strip()
                 
                 # Validate options
                 if not q or not isinstance(options, list) or len(options) != 4:
@@ -1488,20 +1934,26 @@ def generate_quiz():
                     'id': item_id, 
                     'question': q, 
                     'options': options,
-                    'correctAnswer': correct_answer
+                    'correctAnswer': correct_answer,
+                    'topic': topic
                 })
 
             if not normalized:
                 raise RuntimeError('No valid items after normalization')
 
-            return jsonify({'status': 'success', 'items': normalized, 'provider': 'nvidia'})
+            return jsonify({
+                'status': 'success', 
+                'items': normalized, 
+                'title': generated_title,
+                'provider': 'nvidia'
+            })
 
         except Exception as e:
             # 1) LLM JSON repair retry with stricter instruction
             try:
                 repair_prompt = (
                     "CRITICAL: Return ONLY valid JSON in this exact format: "
-                    "{\"items\":[{\"id\":\"uuid\",\"question\":\"specific content question\",\"options\":[\"option1\",\"option2\",\"option3\",\"option4\"],\"correctAnswer\":0}]}\n"
+                    "{\"title\": \"Topic Title\", \"items\":[{\"id\":\"uuid\",\"topic\":\"Topic\",\"question\":\"content question\",\"options\":[\"opt1\",\"opt2\",\"opt3\",\"opt4\"],\"correctAnswer\":0}]}\n"
                     "Each question must be UNIQUE and test different aspects of the content. "
                     "Use specific details, names, numbers, or concepts from the text. "
                     "No explanations, no extra text, just the JSON."
@@ -1552,7 +2004,7 @@ def generate_quiz():
                             break
                     while len(distractors) < 3:
                         distractors.append('Context')
-                    opts = [correct] + distractors[:3]
+                    opts = [correct] + distractors
                     import random
                     random.shuffle(opts)
                     mcq = {
@@ -1641,7 +2093,12 @@ def submit_quiz():
             question_id = question.get('id')
             correct_answer = question.get('correctAnswer', 0)
             user_answer = user_answers.get(question_id)
-            topic = str(question.get('topic') or 'general').strip().lower() or 'general'
+            
+            # Topic extraction with fallback
+            topic = str(question.get('topic') or 'general').strip()
+            if topic.lower() == 'general' and quiz_title and quiz_title != 'Untitled Quiz':
+                topic = quiz_title
+            topic = topic.lower()
             
             is_correct = user_answer == correct_answer
             if is_correct:
@@ -1667,24 +2124,55 @@ def submit_quiz():
 
         # Save to database
         user = _get_current_user()
-        user_id = user.id if user else None
+        user_id_to_save = user.id if user else data.get('user_id')
         
-        quiz_score = QuizScore(
-            user_id=user_id,
-            session_id=session_id if not user_id else None,
-            quiz_title=quiz_title,
-            total_questions=total_questions,
-            correct_answers=correct_count,
-            score_percentage=round(score_percentage, 1),
-            answers_data=results
-        )
+        print(f"DEBUG: submit_quiz user={user}, user_id_to_save={user_id_to_save}, headers={request.headers}")
         
-        try:
-            db.session.add(quiz_score)
-            db.session.commit()
-        except Exception as db_error:
-            db.session.rollback()
-            print(f"Database error saving quiz score: {db_error}")
+        quiz_score_id = None
+        # Allow saving if we have a user_id OR if we want to support anonymous sessions (if model allows)
+        # Assuming we want to save if we have a user_id (even from body)
+        if user_id_to_save:
+            try:
+                quiz_score = QuizScore(
+                    user_id=user_id_to_save,
+                    session_id=session_id,
+                    quiz_title=quiz_title,
+                    total_questions=total_questions,
+                    correct_answers=correct_count,
+                    score_percentage=round(score_percentage, 1),
+                    answers_data=results
+                )
+                db.session.add(quiz_score)
+                if user:
+                    _update_user_streak(user)
+                db.session.commit()
+                quiz_score_id = quiz_score.id
+                print(f"DEBUG: Saved QuizScore id={quiz_score_id} for user_id={user_id_to_save}")
+            except Exception as db_error:
+                db.session.rollback()
+                print(f"Database error saving quiz score: {db_error}")
+        else:
+             # Fallback: Try to save with just session_id if user_id is missing (for anonymous users)
+             # This depends on whether user_id is nullable in QuizScore. 
+             # Based on previous code "skipping QuizScore DB save due to schema constraint", it implies user_id might be required.
+             # But let's try to save with session_id if possible, or just log the warning.
+             try:
+                quiz_score = QuizScore(
+                    user_id=None, # Explicitly None
+                    session_id=session_id,
+                    quiz_title=quiz_title,
+                    total_questions=total_questions,
+                    correct_answers=correct_count,
+                    score_percentage=round(score_percentage, 1),
+                    answers_data=results
+                )
+                db.session.add(quiz_score)
+                db.session.commit()
+                quiz_score_id = quiz_score.id
+                print(f"DEBUG: Saved anonymous QuizScore id={quiz_score_id} with session_id={session_id}")
+             except Exception as db_error:
+                db.session.rollback()
+                print(f"Database error saving anonymous quiz score (likely user_id required): {db_error}")
 
         # Update analytics (in-memory for backward compatibility)
         try:
@@ -1720,7 +2208,7 @@ def submit_quiz():
                 'percentage': round(score_percentage, 1)
             },
             'sessionId': session_id,
-            'quizScoreId': quiz_score.id
+            'quizScoreId': quiz_score_id
         })
         
     except Exception as e:
@@ -1747,16 +2235,80 @@ def analytics_overall():
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
-@app.route('/api/analytics/user/<session_id>', methods=['GET'])
-def analytics_user(session_id):
+def _get_analytics_for_session(session_id):
+    # 1. Try to fetch from DB if session_id looks like a user_id
     try:
-        stats = ANALYTICS['users'].get(session_id)
-        if not stats:
-            return jsonify({'status': 'success', 'message': 'No data for user', 'sessionId': session_id})
-        return jsonify({'status': 'success', 'sessionId': session_id, **stats})
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        user_id = int(session_id)
+        scores = QuizScore.query.filter_by(user_id=user_id).all()
+        if scores:
+            # Filter out dismissed scores
+            dismissed = FocusAreaDismissal.query.filter_by(user_id=user_id).all()
+            dismissed_ids = {d.quiz_score_id for d in dismissed}
+            
+            filtered_scores = [s for s in scores if s.id not in dismissed_ids]
+            
+            # Aggregate stats
+            stats = {
+                'quizzesSubmitted': len(filtered_scores),
+                'questionsAnswered': sum(s.total_questions for s in filtered_scores),
+                'correctAnswers': sum(s.correct_answers for s in filtered_scores),
+                'lastScore': filtered_scores[-1].score_percentage if filtered_scores else 0,
+                'topics': {}
+            }
+            # Reconstruct topic stats
+            for s in filtered_scores:
+                if s.answers_data:
+                    for q in s.answers_data:
+                        topic = str(q.get('topic') or 'general').lower()
+                        tstats = stats['topics'].setdefault(topic, {'total': 0, 'correct': 0})
+                        tstats['total'] += 1
+                        if q.get('isCorrect'):
+                            tstats['correct'] += 1
+            return stats
+    except ValueError:
+        pass
+    
+    # 2. Fallback to in-memory
+    return ANALYTICS['users'].get(session_id)
 
+
+
+
+def _get_youtube_video(query):
+    """
+    Search YouTube for the query and return the top result's details.
+    """
+    try:
+        print(f"DEBUG: Searching YouTube for: {query}", flush=True)
+        videos_search = VideosSearch(query, limit=1)
+        results = videos_search.result()
+        print(f"DEBUG: YouTube results: {results}", flush=True)
+        
+        if results and results.get('result'):
+            video = results['result'][0]
+            return {
+                'link': video.get('link'),
+                'title': video.get('title'),
+                'thumbnail': video.get('thumbnails')[0]['url'] if video.get('thumbnails') else None,
+                'views': video.get('viewCount', {}).get('short')
+            }
+    except Exception as e:
+        print(f"Error searching YouTube for '{query}': {e}")
+    return None
+
+def _get_coding_link(title, details):
+    """
+    Generate a coding practice link based on the step title and details.
+    """
+    keywords = ['practice', 'coding', 'implement', 'algorithm', 'structure', 'code', 'program', 'function', 'class']
+    text = (title + " " + details).lower()
+    
+    if any(k in text for k in keywords):
+        # Construct a search query for LeetCode or similar
+        # For simplicity, we'll search LeetCode problems
+        query = title.replace(' ', '+')
+        return f"https://leetcode.com/problemset/all/?search={query}"
+    return None
 
 @app.route('/api/learning-path-plan', methods=['POST'])
 def learning_path_plan():
@@ -1769,9 +2321,10 @@ def learning_path_plan():
             return jsonify({'error': 'Missing topic'}), 400
 
         prompt = (
-            "You are a learning coach. Create a step-by-step plan for the given topic. "
-            "Return ONLY paragraphs with numbered steps inline (e.g., 'Step 1: ...'). "
-            "No bullet characters. Include suggested video search queries for each step."
+            "You are a learning coach. Create a structured step-by-step plan for the given topic. "
+            "Return a valid JSON array of objects, where each object represents a step/week. "
+            "Format: [{\"step\": 1, \"title\": \"...\", \"details\": \"...\", \"videoQuery\": \"...\"}]. "
+            "Do not include any markdown formatting or explanations outside the JSON."
         )
         user = (
             f"Topic: {topic}\nLevel: {level}\nDurationWeeks: {duration_weeks}\n"
@@ -1780,32 +2333,47 @@ def learning_path_plan():
         text = _nvidia_chat([
             {"role": "system", "content": prompt},
             {"role": "user", "content": user}
-        ], temperature=0.4, max_tokens=1200)
+        ], temperature=0.4, max_tokens=1500)
 
-        # sanitize to remove bullets if any slipped
-        lines = []
-        for ln in text.splitlines():
-            if ln.strip().startswith(('-', '*', '•')):
-                lines.append(ln.lstrip('-*• ').strip())
-            else:
-                lines.append(ln)
-        plan = "\n".join(lines).strip()
+        # Clean up potential markdown code blocks
+        cleaned_text = text.strip()
+        if cleaned_text.startswith("```json"):
+            cleaned_text = cleaned_text[7:]
+        if cleaned_text.startswith("```"):
+            cleaned_text = cleaned_text[3:]
+        if cleaned_text.endswith("```"):
+            cleaned_text = cleaned_text[:-3]
+        cleaned_text = cleaned_text.strip()
 
-        # naive suggestions: extract quoted phrases or use topic
-        suggestions = []
-        import re as _re
-        for m in _re.findall(r'\"([^\"]{4,})\"', plan):
-            suggestions.append(m)
-        if not suggestions:
-            suggestions = [f"{topic} tutorial", f"{topic} explained", f"{topic} practice exercises"]
+        try:
+            plan_data = json.loads(cleaned_text)
+        except json.JSONDecodeError:
+            # Fallback if JSON fails
+            print(f"JSON Decode Error. Raw text: {text}")
+            plan_data = [{"step": 1, "title": "Plan Generation Failed", "details": "Could not generate a structured plan. Please try again.", "videoQuery": topic}]
+        
+        # Enrich plan with YouTube links
+        if isinstance(plan_data, list):
+            for step in plan_data:
+                query = step.get('videoQuery')
+                if query:
+                    video_info = _get_youtube_video(query)
+                    if video_info:
+                        step['videoLink'] = video_info['link']
+                        step['videoTitle'] = video_info['title']
+                        step['videoThumbnail'] = video_info['thumbnail']
+                        step['videoViews'] = video_info['views']
+                
+                # Add coding link if applicable
+                step['codingLink'] = _get_coding_link(step.get('title', ''), step.get('details', ''))
 
         return jsonify({
             'status': 'success',
             'topic': topic,
             'level': level,
             'durationWeeks': duration_weeks,
-            'plan': plan,
-            'videoQueries': suggestions[:6]
+            'plan': plan_data, # Now a list of objects
+            'videoQueries': [p.get('videoQuery') for p in plan_data if p.get('videoQuery')]
         })
     except Exception as e:
         return jsonify({'error': str(e)}), 500
@@ -1813,7 +2381,7 @@ def learning_path_plan():
 @app.route('/api/recommendations/<session_id>', methods=['GET'])
 def recommendations(session_id):
     try:
-        stats = ANALYTICS['users'].get(session_id)
+        stats = _get_analytics_for_session(session_id)
         if not stats:
             return jsonify({'status': 'success', 'sessionId': session_id, 'message': 'No history yet', 'recommendations': []})
 
@@ -1840,22 +2408,19 @@ def recommendations(session_id):
         for s in sorted(strengths, key=lambda x: (-x['accuracy'], -x['total']))[:3]:
             recs.append({
                 'topic': s['topic'],
-                'action': 'advance_level',
-                'details': 'Attempt harder questions and real-world applications for this topic.'
+                'action': 'advance',
+                'details': 'Try intermediate/advanced questions or teach this topic to others.'
             })
+        
         if not recs:
-            recs.append({
-                'topic': 'general',
-                'action': 'balanced_review',
-                'details': 'Mix of review and new practice; no clear strengths/weaknesses yet.'
-            })
+            recs.append({'topic': 'General', 'action': 'explore', 'details': 'Take more quizzes to get personalized recommendations.'})
 
         return jsonify({
             'status': 'success',
             'sessionId': session_id,
+            'recommendations': recs,
             'strengths': strengths,
-            'weaknesses': weaknesses,
-            'recommendations': recs
+            'weaknesses': weaknesses
         })
     except Exception as e:
         return jsonify({'error': str(e)}), 500
@@ -1873,17 +2438,40 @@ def _aggregate_skill_stats(user, session_id: str):
     if user:
         query = query.filter_by(user_id=user.id)
     else:
-        # fall back to anonymous session-based tracking
-        query = query.filter_by(session_id=session_id)
+        # Try to interpret session_id as user_id if it's an integer
+        try:
+            possible_user_id = int(session_id)
+            query = query.filter_by(user_id=possible_user_id)
+        except ValueError:
+            # fall back to anonymous session-based tracking
+            query = query.filter_by(session_id=session_id)
 
     # Order by created_at so "lastPracticedAt" is meaningful
     scores = query.order_by(QuizScore.created_at.asc()).all()
+
+    # Filter out dismissed topics
+    dismissed_ids = set()
+    if user:
+        dismissed = FocusAreaDismissal.query.filter_by(user_id=user.id).all()
+        dismissed_ids = {d.quiz_score_id for d in dismissed}
+        print(f"DEBUG: _aggregate_skill_stats user={user.id}, dismissed_ids={dismissed_ids}", flush=True)
+    else:
+        print(f"DEBUG: _aggregate_skill_stats user=None, session_id={session_id}", flush=True)
+
+    # The scores were already fetched by the 'query' object.
+    # We will now iterate and filter them.
+    
+    print(f"DEBUG: Found {len(scores)} scores. Filtering...", flush=True)
 
     topics = {}
     overall_questions = 0
     overall_correct = 0
 
     for score in scores:
+        if score.id in dismissed_ids:
+            print(f"DEBUG: Skipping dismissed score {score.id}", flush=True)
+            continue
+        
         answers = score.answers_data or []
         if not isinstance(answers, list):
             continue
@@ -1984,6 +2572,64 @@ def learning_path_skills(session_id):
             **stats
         })
     except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+
+
+@app.route('/api/learning-path/dismiss-topic', methods=['POST'])
+def dismiss_topic():
+    user = _get_current_user()
+    if not user:
+        return jsonify({'error': 'Unauthorized'}), 401
+    
+    data = request.get_json()
+    topic = data.get('topic')
+    if not topic:
+        return jsonify({'error': 'Topic required'}), 400
+        
+    # Find all scores for this topic and dismiss them
+    scores = QuizScore.query.filter_by(user_id=user.id).all()
+    count = 0
+    print(f"DEBUG: dismiss_topic request for '{topic}' by user {user.id}. Found {len(scores)} total scores.", flush=True)
+    
+    for score in scores:
+        answers = score.answers_data or []
+        if not isinstance(answers, list): continue
+        
+        score_topic = 'general'
+        if answers:
+            # simple heuristic: take first answer's topic
+            score_topic = str((answers[0].get('topic') or 'general')).strip().lower()
+        
+        print(f"DEBUG: Checking score {score.id} with topic '{score_topic}' against target '{topic.strip().lower()}'", flush=True)
+            
+        if score_topic == topic.strip().lower():
+            # Check if already dismissed
+            existing = FocusAreaDismissal.query.filter_by(user_id=user.id, quiz_score_id=score.id).first()
+            if not existing:
+                db.session.add(FocusAreaDismissal(user_id=user.id, quiz_score_id=score.id))
+                count += 1
+                print(f"DEBUG: Dismissing score {score.id}", flush=True)
+                
+    db.session.commit()
+    print(f"DEBUG: Dismissed {count} scores.", flush=True)
+    return jsonify({'message': f'Dismissed {count} scores for topic {topic}'})
+
+@app.route('/api/learning-path/reset', methods=['POST'])
+def reset_progress():
+    user = _get_current_user()
+    if not user:
+        return jsonify({'error': 'Unauthorized'}), 401
+        
+    # Delete all QuizScores for this user
+    try:
+        QuizScore.query.filter_by(user_id=user.id).delete()
+        FocusAreaDismissal.query.filter_by(user_id=user.id).delete()
+        db.session.commit()
+        return jsonify({'message': 'Progress reset successfully'})
+    except Exception as e:
+        db.session.rollback()
         return jsonify({'error': str(e)}), 500
 
 
@@ -2120,5 +2766,807 @@ def get_quiz_scores():
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
+# --- Analytics Endpoints ---
+
+@app.route('/api/analytics/dashboard', methods=['GET'])
+def analytics_dashboard():
+    user = _get_current_user()
+    if not user:
+        return jsonify({'error': 'Unauthorized'}), 401
+
+    # 1. Calculate total quizzes and average score
+    scores = QuizScore.query.filter_by(user_id=user.id).all()
+    total_quizzes = len(scores)
+    
+    if total_quizzes == 0:
+        return jsonify({
+            'total_quizzes': 0,
+            'average_score': 0,
+            'recent_activity': [],
+            'weak_areas': []
+        })
+
+    avg_score = sum(s.score_percentage for s in scores) / total_quizzes
+    
+    # 2. Recent activity (last 10 quizzes)
+    recent_scores = QuizScore.query.filter_by(user_id=user.id)\
+        .order_by(QuizScore.created_at.desc())\
+        .limit(10).all()
+    
+    recent_activity = []
+    for s in reversed(recent_scores): # Show oldest to newest in chart
+        recent_activity.append({
+            'date': s.created_at.strftime('%Y-%m-%d'),
+            'score': s.score_percentage
+        })
+
+    # 3. Identify weak areas (score < 60%) excluding dismissed ones
+    # Get dismissed IDs
+    dismissed = FocusAreaDismissal.query.filter_by(user_id=user.id).all()
+    dismissed_ids = set(d.quiz_score_id for d in dismissed)
+    
+    weak_areas = []
+    # We'll look at the last 20 quizzes to find weak areas
+    recent_20 = QuizScore.query.filter_by(user_id=user.id)\
+        .order_by(QuizScore.created_at.desc())\
+        .limit(20).all()
+        
+    for s in recent_20:
+        if s.score_percentage < 60 and s.id not in dismissed_ids:
+            weak_areas.append({
+                'id': s.id,
+                'title': s.quiz_title or 'Untitled Quiz',
+                'date': s.created_at.strftime('%Y-%m-%d'),
+                'score': s.score_percentage,
+                # For now, we don't have a direct video link in QuizScore, 
+                # but we could add logic to suggest one based on the title.
+                # Leaving it null or adding a placeholder if needed.
+                'video_suggestion_url': None 
+            })
+            
+    # 4. Get Streak Data
+    current_streak = user.current_streak or 0
+    max_streak = user.max_streak or 0
+    
+    # Check if streak is broken (i.e. last activity was before yesterday)
+    # But strictly speaking, today's activity might not have happened yet.
+    # If last_activity_date < yesterday, streak is effectively 0 for display until they do something today?
+    # Or we display the stored streak?
+    # Usually apps display the streak from yesterday if today hasn't happened yet, but if they miss today it resets tomorrow.
+    # Let's just return what's in DB. The update logic handles the reset.
+
+    return jsonify({
+        'total_quizzes': total_quizzes,
+        'average_score': round(avg_score, 1),
+        'recent_activity': recent_activity,
+        'weak_areas': weak_areas,
+        'streak': {
+            'current': current_streak,
+            'max': max_streak,
+            'last_activity': user.last_activity_date.isoformat() if user.last_activity_date else None
+        }
+    })
+
+def _update_user_streak(user):
+    """
+    Updates the user's streak based on activity (called when they do something significant).
+    """
+    now = datetime.utcnow().date()
+    # last_activity_date is db.Date, so it's already a date object (or None)
+    last = user.last_activity_date 
+    
+    if last == now:
+        return # Already counted for today
+        
+    if last == now - timedelta(days=1):
+        # Consecutive day
+        user.current_streak = (user.current_streak or 0) + 1
+    else:
+        # Broken streak or first time
+        user.current_streak = 1
+        
+    # Update max
+    if (user.current_streak or 0) > (user.max_streak or 0):
+        user.max_streak = user.current_streak
+        
+    user.last_activity_date = now # Assign date object, not datetime
+    db.session.commit()
+
+@app.route('/api/analytics/focus-area/<int:id>', methods=['DELETE'])
+def delete_focus_area(id):
+    user = _get_current_user()
+    if not user:
+        return jsonify({'error': 'Unauthorized'}), 401
+        
+    # Verify the quiz score belongs to the user
+    score = QuizScore.query.get(id)
+    if not score or score.user_id != user.id:
+        return jsonify({'error': 'Focus area not found'}), 404
+        
+    # Check if already dismissed
+    existing = FocusAreaDismissal.query.filter_by(user_id=user.id, quiz_score_id=id).first()
+    if existing:
+        return jsonify({'message': 'Already dismissed'})
+        
+    dismissal = FocusAreaDismissal(user_id=user.id, quiz_score_id=id)
+    db.session.add(dismissal)
+    
+    try:
+        db.session.commit()
+        return jsonify({'message': 'Focus area dismissed'})
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/learning-path/save', methods=['POST'])
+def save_learning_path():
+    user = _get_current_user()
+    if not user:
+        return jsonify({'error': 'Unauthorized'}), 401
+    
+    try:
+        data = request.get_json()
+        topic = data.get('topic')
+        level = data.get('level')
+        plan = data.get('plan')
+        
+        if not topic or not plan:
+            return jsonify({'error': 'Missing data'}), 400
+            
+        # Create LearningPath
+        lp = LearningPath(
+            user_id=user.id,
+            topic=topic,
+            level=level,
+            total_steps=len(plan),
+            completed_steps=0
+        )
+        db.session.add(lp)
+        db.session.flush() # Get ID
+        
+        # Create Steps
+        for step in plan:
+            s = LearningPathStep(
+                learning_path_id=lp.id,
+                step_number=step.get('step'),
+                title=step.get('title'),
+                details=step.get('details'),
+                video_query=step.get('videoQuery'),
+                video_link=step.get('videoLink'),
+                video_title=step.get('videoTitle'),
+                video_thumbnail=step.get('videoThumbnail'),
+                video_views=step.get('videoViews'),
+                coding_link=step.get('codingLink')
+            )
+            db.session.add(s)
+            
+        db.session.commit()
+        return jsonify({'status': 'success', 'id': lp.id, 'message': 'Learning path saved'})
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/learning-paths', methods=['GET'])
+def get_learning_paths():
+    user = _get_current_user()
+    if not user:
+        return jsonify({'error': 'Unauthorized'}), 401
+        
+    try:
+        paths = LearningPath.query.filter_by(user_id=user.id).order_by(LearningPath.created_at.desc()).all()
+        return jsonify({
+            'status': 'success',
+            'paths': [p.to_dict() for p in paths]
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/learning-path/<int:path_id>', methods=['GET'])
+def get_learning_path_details(path_id):
+    user = _get_current_user()
+    if not user:
+        return jsonify({'error': 'Unauthorized'}), 401
+        
+    try:
+        lp = LearningPath.query.filter_by(id=path_id, user_id=user.id).first()
+        if not lp:
+            return jsonify({'error': 'Not found'}), 404
+            
+        steps = LearningPathStep.query.filter_by(learning_path_id=lp.id).order_by(LearningPathStep.step_number.asc()).all()
+        
+        data = lp.to_dict()
+        data['steps'] = [s.to_dict() for s in steps]
+        
+        return jsonify({'status': 'success', 'path': data})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/learning-path/step/<int:step_id>/toggle', methods=['POST'])
+def toggle_step_progress(step_id):
+    user = _get_current_user()
+    if not user:
+        return jsonify({'error': 'Unauthorized'}), 401
+        
+    try:
+        step = LearningPathStep.query.join(LearningPath).filter(
+            LearningPathStep.id == step_id,
+            LearningPath.user_id == user.id
+        ).first()
+        
+        if not step:
+            return jsonify({'error': 'Not found'}), 404
+            
+        step.is_completed = not step.is_completed
+        
+        # Update parent progress
+        lp = step.learning_path
+        completed_count = LearningPathStep.query.filter_by(learning_path_id=lp.id, is_completed=True).count()
+        lp.completed_steps = completed_count
+        
+        db.session.commit()
+        
+        return jsonify({
+            'status': 'success', 
+            'is_completed': step.is_completed,
+            'video_watched': step.video_watched,
+            'code_practiced': step.code_practiced,
+            'path_progress': lp.to_dict()['progress']
+        })
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/learning-path/<int:path_id>', methods=['DELETE'])
+def delete_learning_path(path_id):
+    user = _get_current_user()
+    if not user:
+        return jsonify({'error': 'Unauthorized'}), 401
+        
+    try:
+        lp = LearningPath.query.filter_by(id=path_id, user_id=user.id).first()
+        if not lp:
+            return jsonify({'error': 'Not found'}), 404
+            
+        db.session.delete(lp)
+        db.session.commit()
+        return jsonify({'status': 'success', 'message': 'Deleted'})
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'error': str(e)}), 500
+
+
+# --- Feynman Mode Endpoints ---
+
+@app.route('/api/feynman/start', methods=['POST'])
+def start_feynman_session():
+    print("DEBUG: start_feynman_session hit", flush=True)
+    try:
+        user = _get_current_user()
+        print(f"DEBUG: User retrieved: {user}", flush=True)
+        if not user:
+            print("DEBUG: No user found, returning 401", flush=True)
+            return jsonify({'error': 'Unauthorized'}), 401
+
+        data = request.get_json()
+        print(f"DEBUG: Request data: {data}", flush=True)
+        topic = data.get('topic')
+        persona = data.get('persona', 'Curious 5-Year-Old')
+
+        if not topic:
+            print("DEBUG: No topic provided", flush=True)
+            return jsonify({'error': 'Topic is required'}), 400
+
+        session_id = str(uuid.uuid4())
+        title = f"Teaching: {topic} ({persona})"
+        
+        print(f"DEBUG: Creating session {session_id}", flush=True)
+        session = ChatSession(
+            id=session_id,
+            user_id=user.id,
+            title=title,
+            mode='feynman'
+        )
+        db.session.add(session)
+        print("DEBUG: Session added to db session", flush=True)
+        
+        db.session.commit()
+        print("DEBUG: Database commit successful", flush=True)
+        
+        greeting = f"I'm ready to learn about {topic}! I'm a {persona}, so please explain it simply."
+        
+        # Save greeting to history
+        init_msg = ChatHistory(
+            session_id=session_id,
+            user_id=user.id,
+            user_message=f"I want to teach you about {topic}.",
+            ai_response=greeting,
+            context='feynman'
+        )
+        db.session.add(init_msg)
+        db.session.commit()
+        print("DEBUG: Greeting saved to history", flush=True)
+        
+        return jsonify({
+            'session_id': session_id,
+            'title': title,
+            'greeting': greeting
+        })
+    except Exception as e:
+        print(f"ERROR in start_feynman_session: {e}", flush=True)
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/feynman/chat', methods=['POST'])
+def feynman_chat():
+    print("DEBUG: feynman_chat hit", flush=True)
+    try:
+        user = _get_current_user()
+        if not user:
+            print("DEBUG: Unauthorized in chat", flush=True)
+            return jsonify({'error': 'Unauthorized'}), 401
+
+        data = request.get_json()
+        session_id = data.get('session_id')
+        user_message = data.get('message')
+        topic = data.get('topic')
+        persona = data.get('persona')
+        
+        print(f"DEBUG: Chat request for session {session_id}", flush=True)
+
+        if not session_id or not user_message:
+            return jsonify({'error': 'Missing session_id or message'}), 400
+
+        # Fetch chat history
+        # Ensure ChatHistory is imported or available
+        print("DEBUG: Fetching history", flush=True)
+        history = ChatHistory.query.filter_by(session_id=session_id).order_by(ChatHistory.created_at.asc()).all()
+        
+        messages = []
+        # System Prompt
+        messages.append({
+            "role": "system", 
+            "content": f"You are a {persona}. The user is teaching you about {topic}. "
+                       f"You know NOTHING about the topic beforehand. "
+                       f"Only ask questions based on what the user explicitly said. "
+                       f"Do not introduce new terms or concepts unless the user mentioned them. "
+                       f"If the explanation is vague, ask for clarification on the words used."
+        })
+        
+        for h in history:
+            messages.append({"role": "user", "content": h.user_message})
+            messages.append({"role": "assistant", "content": h.ai_response})
+        
+        messages.append({"role": "user", "content": user_message})
+
+        print("DEBUG: Calling LLM", flush=True)
+        ai_text = _nvidia_chat(messages, temperature=0.7, max_tokens=300)
+        print("DEBUG: LLM response received", flush=True)
+
+        # Save to history
+        chat_entry = ChatHistory(
+            session_id=session_id,
+            user_id=user.id,
+            user_message=user_message,
+            ai_response=ai_text,
+            context='feynman'
+        )
+        db.session.add(chat_entry)
+        db.session.commit()
+        print("DEBUG: Chat saved", flush=True)
+
+        return jsonify({'response': ai_text})
+
+    except Exception as e:
+        print(f"Error in feynman chat: {e}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/feynman/evaluate', methods=['POST'])
+def evaluate_feynman_session():
+    user = _get_current_user()
+    if not user:
+        return jsonify({'error': 'Unauthorized'}), 401
+
+    data = request.get_json()
+    session_id = data.get('session_id')
+    topic = data.get('topic')
+    persona = data.get('persona')
+
+    if not session_id:
+        return jsonify({'error': 'Missing session_id'}), 400
+
+    history = ChatHistory.query.filter_by(session_id=session_id).order_by(ChatHistory.created_at.asc()).all()
+    
+    if not history:
+        return jsonify({'error': 'No history to evaluate'}), 400
+
+    transcript = ""
+    for h in history:
+        transcript += f"User: {h.user_message}\\nAI ({persona}): {h.ai_response}\\n"
+
+    evaluation_prompt = f"""
+    Analyze the following teaching session where a user tried to teach '{topic}' to a '{persona}'.
+    
+    Transcript:
+    {transcript}
+    
+    Evaluate the user on:
+    1. Clarity (0-100)
+    2. Depth of Understanding (0-100)
+    3. Overall Mastery Score (0-100)
+    
+    Provide constructive feedback on what they explained well and what they missed.
+    
+    Return valid JSON ONLY. No markdown. No explanations.
+    Format:
+    {{
+        "clarity_score": <number 0-100>,
+        "depth_score": <number 0-100>,
+        "overall_score": <number 0-100>,
+        "feedback": "<string>"
+    }}
+    """
+
+    try:
+        print("DEBUG: Calling LLM for evaluation", flush=True)
+        eval_text = _nvidia_chat(
+            [{"role": "user", "content": evaluation_prompt}],
+            temperature=0.2,
+            max_tokens=500
+        )
+        print(f"DEBUG: Eval response: {eval_text}", flush=True)
+        
+        # Parse JSON from response
+        import json
+        import re
+        try:
+            # Remove markdown code blocks if present
+            clean_text = re.sub(r'```json\s*|\s*```', '', eval_text).strip()
+            
+            # Try to find JSON block if there's extra text
+            start = clean_text.find('{')
+            end = clean_text.rfind('}') + 1
+            if start != -1 and end != -1:
+                json_str = clean_text[start:end]
+                eval_data = json.loads(json_str)
+            else:
+                # If no braces found, try loading the whole string
+                eval_data = json.loads(clean_text)
+        except Exception as parse_err:
+            print(f"ERROR parsing eval JSON: {parse_err}", flush=True)
+            # Fallback: try to extract numbers using regex if JSON fails
+            clarity = re.search(r'clarity_score"?\s*:\s*(\d+)', eval_text)
+            depth = re.search(r'depth_score"?\s*:\s*(\d+)', eval_text)
+            overall = re.search(r'overall_score"?\s*:\s*(\d+)', eval_text)
+            
+            eval_data = {
+                "clarity_score": int(clarity.group(1)) if clarity else 0,
+                "depth_score": int(depth.group(1)) if depth else 0,
+                "overall_score": int(overall.group(1)) if overall else 0,
+                "feedback": "Could not parse detailed feedback. " + eval_text[:100] + "..."
+            }
+
+        # Save Score
+        score_entry = FeynmanScore(
+            user_id=user.id,
+            session_id=session_id,
+            topic=topic,
+            persona=persona,
+            score=eval_data.get('overall_score', 0),
+            clarity_score=eval_data.get('clarity_score', 0),
+            depth_score=eval_data.get('depth_score', 0),
+            feedback=eval_data.get('feedback', '')
+        )
+        db.session.add(score_entry)
+        db.session.commit()
+        
+        return jsonify(score_entry.to_dict())
+
+    except Exception as e:
+        print(f"Error evaluating session: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/analytics/user/<user_id>', methods=['GET'])
+def analytics_user(user_id):
+    try:
+        user = _get_current_user()
+        # If user_id is passed in URL, we might want to verify it matches current user or allow admin access
+        # For now, we'll use the logic in _aggregate_skill_stats which handles user/session lookup
+        stats = _aggregate_skill_stats(user, user_id)
+        return jsonify(stats)
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/recommendations/<user_id>', methods=['GET'])
+def recommendations_user(user_id):
+    try:
+        user = _get_current_user()
+        stats = _aggregate_skill_stats(user, user_id)
+        
+        # Extract strengths and weaknesses
+        skills = stats.get('skills', [])
+        strengths = [s for s in skills if s['strengthBand'] == 'strong']
+        weaknesses = [s for s in skills if s['strengthBand'] == 'weak']
+        
+        # Generate recommendations based on weaknesses
+        recs = []
+        for w in weaknesses[:3]:
+            recs.append({
+                'topic': w['topic'],
+                'action': 'Review core concepts',
+                'details': f"Your mastery is {w['masteryScore']}%. Try more practice quizzes."
+            })
+            
+        if not recs and skills:
+             # If no weaknesses, recommend advancing in strongest areas
+            for s in skills[:3]:
+                recs.append({
+                    'topic': s['topic'],
+                    'action': 'Advance to next level',
+                    'details': f"You are doing great in {s['topic']}! Try advanced topics."
+                })
+
+        return jsonify({
+            'strengths': strengths,
+            'weaknesses': weaknesses,
+            'recommendations': recs
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+
+@app.route('/api/learning-path-plan', methods=['POST'])
+def generate_learning_path_plan():
+    print("DEBUG: generate_learning_path_plan hit", flush=True)
+    try:
+        data = request.get_json()
+        topic = data.get('topic')
+        level = data.get('level')
+        duration_weeks = data.get('durationWeeks', 2)
+        
+        if not topic or not level:
+            return jsonify({'error': 'Topic and level are required'}), 400
+            
+        prompt = (
+            f"Create a detailed {duration_weeks}-week learning path for '{topic}' at {level} level. "
+            "Return a JSON object with a 'plan' key containing a list of steps. "
+            "Each step should have: 'step' (number), 'title', 'details', 'videoQuery' (search query for video), 'codingLink' (optional). "
+            "Do not include any markdown formatting, just raw JSON."
+        )
+        
+        response_text = _nvidia_chat([{"role": "user", "content": prompt}], temperature=0.7, max_tokens=2000)
+        
+        # Clean up response if it contains markdown code blocks
+        if "```json" in response_text:
+            response_text = response_text.split("```json")[1].split("```")[0].strip()
+        elif "```" in response_text:
+            response_text = response_text.split("```")[1].split("```")[0].strip()
+            
+        plan_data = json.loads(response_text)
+        
+        # Add video queries and fetch video details
+        for step in plan_data.get('plan', []):
+            if 'videoQuery' not in step:
+                step['videoQuery'] = f"{topic} {step['title']} tutorial"
+            
+            # Fetch video details
+            video_details = _get_youtube_video(step['videoQuery'])
+            if video_details:
+                step['videoLink'] = video_details.get('link')
+                step['videoTitle'] = video_details.get('title')
+                step['videoThumbnail'] = video_details.get('thumbnail')
+                step['videoViews'] = video_details.get('views')
+                
+        return jsonify({
+            'topic': topic,
+            'level': level,
+            'plan': plan_data.get('plan', []),
+            'videoQueries': [s['videoQuery'] for s in plan_data.get('plan', [])][:5]
+        })
+        
+    except Exception as e:
+        print(f"Error generating plan: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+
+
+
+
+
+
+# --- Community Endpoints ---
+
+@app.route('/api/community/topics', methods=['GET'])
+def get_community_topics():
+    try:
+        topics = CommunityTopic.query.order_by(CommunityTopic.created_at.desc()).all()
+        return jsonify({
+            'status': 'success',
+            'topics': [t.to_dict() for t in topics]
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/community/topics', methods=['POST'])
+def create_community_topic():
+    user = _get_current_user()
+    if not user:
+        return jsonify({'error': 'Unauthorized'}), 401
+    
+    data = request.get_json()
+    title = (data.get('title') or '').strip()
+    content = (data.get('content') or '').strip()
+    
+    if not title or not content:
+        return jsonify({'error': 'Title and content are required'}), 400
+        
+    try:
+        topic = CommunityTopic(
+            user_id=user.id,
+            title=title,
+            content=content
+        )
+        db.session.add(topic)
+        _update_user_streak(user)
+        db.session.commit()
+        return jsonify({'status': 'success', 'topic': topic.to_dict()})
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/community/topics/<int:topic_id>', methods=['GET'])
+def get_community_topic_details(topic_id):
+    try:
+        topic = CommunityTopic.query.get(topic_id)
+        if not topic:
+            return jsonify({'error': 'Topic not found'}), 404
+            
+        topic_data = topic.to_dict()
+        # Include comments
+        topic_data['comments'] = [c.to_dict() for c in topic.comments]
+        return jsonify(topic_data)
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/community/topics/<int:topic_id>/comments', methods=['POST'])
+def add_community_comment(topic_id):
+    user = _get_current_user()
+    if not user:
+        return jsonify({'error': 'Unauthorized'}), 401
+    
+    data = request.get_json()
+    content = (data.get('content') or '').strip()
+    
+    if not content:
+        return jsonify({'error': 'Content is required'}), 400
+        
+    try:
+        topic = CommunityTopic.query.get(topic_id)
+        if not topic:
+            return jsonify({'error': 'Topic not found'}), 404
+            
+        comment = CommunityComment(
+            topic_id=topic.id,
+            user_id=user.id,
+            content=content
+        )
+        db.session.add(comment)
+        db.session.commit()
+        return jsonify({'status': 'success', 'comment': comment.to_dict()})
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/community/topics/<int:topic_id>/like', methods=['POST'])
+def like_community_topic(topic_id):
+    user = _get_current_user()
+    if not user:
+        return jsonify({'error': 'Unauthorized'}), 401
+    
+    try:
+        topic = CommunityTopic.query.get(topic_id)
+        if not topic:
+            return jsonify({'error': 'Topic not found'}), 404
+            
+        # Simple like increment for now (user can like multiple times? Maybe restriction needed in future)
+        # Ideally we'd have a Likes table to prevent dupes. For now just increment.
+        topic.likes += 1
+        db.session.commit()
+        return jsonify({'status': 'success', 'likes': topic.likes})
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'error': str(e)}), 500
+
+
+
+@app.route('/api/community/topics/<int:topic_id>', methods=['DELETE'])
+def delete_community_topic(topic_id):
+    user = _get_current_user()
+    if not user:
+        return jsonify({'error': 'Unauthorized'}), 401
+    
+    try:
+        topic = CommunityTopic.query.get(topic_id)
+        if not topic:
+            return jsonify({'error': 'Topic not found'}), 404
+            
+        if topic.user_id != user.id:
+            return jsonify({'error': 'You can only delete your own topics'}), 403
+            
+        db.session.delete(topic)
+        db.session.commit()
+        return jsonify({'status': 'success', 'message': 'Topic deleted'})
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'error': str(e)}), 500
+
+
+
+@app.route('/api/learning-path/step/<int:step_id>/action', methods=['POST'])
+def toggle_step_action(step_id):
+    user = _get_current_user()
+    if not user:
+        return jsonify({'error': 'Unauthorized'}), 401
+    
+    try:
+        data = request.json
+        action = data.get('action') # 'video', 'code', 'complete'
+        
+        step = LearningPathStep.query.get(step_id)
+        if not step:
+            return jsonify({'error': 'Step not found'}), 404
+            
+        # Verify ownership via path
+        path = LearningPath.query.get(step.learning_path_id)
+        if path.user_id != user.id:
+            return jsonify({'error': 'Unauthorized'}), 403
+            
+        if action == 'video':
+            step.video_watched = not step.video_watched
+        elif action == 'code':
+            step.code_practiced = not step.code_practiced
+        elif action == 'complete':
+             step.is_completed = not step.is_completed
+             if step.is_completed:
+                 step.video_watched = True
+                 if step.coding_link:
+                     step.code_practiced = True
+        
+        # Check auto-complete
+        has_video = bool(step.video_link)
+        has_code = bool(step.coding_link)
+        
+        is_video_done = not has_video or step.video_watched
+        is_code_done = not has_code or step.code_practiced
+        
+        if is_video_done and is_code_done:
+             step.is_completed = True
+        elif action != 'complete':
+             # If we toggled a subtask off and it wasn't a 'complete' action, we might need to uncomplete
+             if step.is_completed:
+                 step.is_completed = False
+
+        db.session.commit()
+        
+        # Update path progress
+        total = len(path.steps)
+        completed = sum(1 for s in path.steps if s.is_completed)
+        path.completed_steps = completed
+        db.session.commit()
+        
+        return jsonify({
+            'status': 'success', 
+            'step': step.to_dict(),
+            'path_progress': path.to_dict()['progress']
+        })
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'error': str(e)}), 500
+
+
 if __name__ == '__main__':
-    app.run(debug=True, host='0.0.0.0', port=5000) 
+    app.run(debug=True, host='0.0.0.0', port=5000)
+
